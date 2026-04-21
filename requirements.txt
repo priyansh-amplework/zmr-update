@@ -1,0 +1,3 @@
+# Repo root shim: the Python app lives in `zmr-update/`. Railway (and local tools)
+# that build from the git root need this file so Nixpacks/pip see dependencies.
+-r zmr-update/requirements.txt

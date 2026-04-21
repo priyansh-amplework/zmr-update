@@ -10,7 +10,7 @@
 builder = "NIXPACKS"
 
 [deploy]
-startCommand = "sh -c 'mkdir -p /tmp/streamlit-cache && export HOME=/tmp/streamlit-cache && exec python -m streamlit run streamlit_rbac_ui.py --server.headless=true --server.address=0.0.0.0 --server.port=$PORT --server.fileWatcherType none --browser.gatherUsageStats=false'"
+startCommand = "sh -c \"mkdir -p /tmp/streamlit-cache && export HOME=/tmp/streamlit-cache && exec python -m streamlit run streamlit_rbac_ui.py --server.headless=true --server.address=0.0.0.0 --server.port=$PORT --server.fileWatcherType none --browser.gatherUsageStats=false\""
 healthcheckPath = "/_stcore/health"
 healthcheckTimeout = 300
 restartPolicyType = "ON_FAILURE"
