@@ -395,6 +395,18 @@ def retrieval_status() -> Dict[str, Any]:
         except Exception as e:
             out["pinecone_per_index"][name] = {"ok": False, "error": str(e)}
 
+    try:
+        from zmr_brain.gcs_client import gcs_bucket_probe, gcs_credentials_mode
+
+        gcs = gcs_credentials_mode()
+        gcs["bucket_probe"] = gcs_bucket_probe()
+        out["gcs"] = gcs
+    except Exception as e:
+        out["gcs"] = {"error": str(e)}
+
+    sha = (os.getenv("RAILWAY_GIT_COMMIT_SHA") or "").strip()
+    out["deploy"] = {"railway_git_commit_sha": sha or None}
+
     return out
 
 

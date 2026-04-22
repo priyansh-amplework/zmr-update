@@ -3,8 +3,9 @@ Google Cloud Storage helpers — use *your* bucket as an alternative to the clie
 
 Configure via .env:
   GCS_ARTIFACTS_BUCKET       — required for chunk uploads (ingest scripts do not write local bodies)
-  GCS_APPLICATION_CREDENTIALS — optional JSON key path used *only* for Storage
-                                (if unset, uses GOOGLE_APPLICATION_CREDENTIALS)
+  GCS_APPLICATION_CREDENTIALS — JSON **file** path **or** inline JSON (if value starts with ``{``)
+  GOOGLE_APPLICATION_CREDENTIALS_JSON — optional **inline** service-account JSON (Railway-friendly; one line is safest)
+  GOOGLE_APPLICATION_CREDENTIALS — file path **or** inline JSON (if value starts with ``{``)
   GCS_PROJECT_ID             — optional; Storage client project (default: key's project_id)
   GCS_ARTIFACTS_PREFIX       — optional object prefix, e.g. zmr-dev/prakash/
 
@@ -14,12 +15,103 @@ your SA roles/storage.objectAdmin (or objectViewer for read-only retrieval).
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from google.cloud import storage
+
+
+def _strip_inline_env_json(raw: str) -> str:
+    """Railway/editor sometimes add a BOM or stray whitespace before ``{``."""
+    s = (raw or "").strip()
+    if s.startswith("\ufeff"):
+        s = s.lstrip("\ufeff").strip()
+    return s
+
+
+def _load_service_account_info_from_env() -> Optional[Dict[str, Any]]:
+    """Parse inline JSON from env (Railway often cannot mount a key file)."""
+    for key in ("GOOGLE_APPLICATION_CREDENTIALS_JSON", "GCS_SERVICE_ACCOUNT_JSON"):
+        raw = _strip_inline_env_json(os.getenv(key) or "")
+        if raw.startswith("{"):
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+    raw_g = _strip_inline_env_json(os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "")
+    if raw_g.startswith("{"):
+        try:
+            return json.loads(raw_g)
+        except json.JSONDecodeError:
+            pass
+    raw_c = _strip_inline_env_json(os.getenv("GCS_APPLICATION_CREDENTIALS") or "")
+    if raw_c.startswith("{"):
+        try:
+            return json.loads(raw_c)
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+def _env_json_shape(key: str) -> str:
+    """Non-secret hint: whether an env value looks like inline JSON and if it parses."""
+    raw = _strip_inline_env_json(os.getenv(key) or "")
+    if not raw:
+        return "unset"
+    if not raw.startswith("{"):
+        return "not_json_string"
+    try:
+        json.loads(raw)
+        return "inline_json_parse_ok"
+    except json.JSONDecodeError:
+        return "inline_json_parse_failed"
+
+
+def gcs_credentials_mode() -> Dict[str, Any]:
+    """Non-secret summary for ``/v1/retrieval-status`` (how GCS reads will authenticate)."""
+    info = _load_service_account_info_from_env()
+    if info:
+        return {
+            "mode": "inline_json",
+            "client_email": info.get("client_email"),
+            "project_id": info.get("project_id"),
+        }
+    path = _credentials_json_path()
+    if path:
+        return {"mode": "json_file", "file_name": path.name}
+    return {
+        "mode": "adc_default",
+        "note": "No JSON file or inline JSON found; google.cloud uses Application Default Credentials "
+        "(often missing on Railway). Chunk bodies in gs:// will not load unless you set "
+        "GOOGLE_APPLICATION_CREDENTIALS_JSON or a path to a key file.",
+        "env_json_shape": {
+            "GOOGLE_APPLICATION_CREDENTIALS": _env_json_shape("GOOGLE_APPLICATION_CREDENTIALS"),
+            "GCS_APPLICATION_CREDENTIALS": _env_json_shape("GCS_APPLICATION_CREDENTIALS"),
+            "GOOGLE_APPLICATION_CREDENTIALS_JSON": _env_json_shape(
+                "GOOGLE_APPLICATION_CREDENTIALS_JSON"
+            ),
+        },
+    }
+
+
+def gcs_bucket_probe(*, timeout_sec: float = 12.0) -> Dict[str, Any]:
+    """
+    One lightweight GCS call for diagnostics: whether the configured bucket is visible
+    with current credentials (auth + IAM), without downloading chunk objects.
+    """
+    name = (os.getenv("GCS_ARTIFACTS_BUCKET") or "").strip()
+    if not name:
+        return {"ok": False, "reason": "GCS_ARTIFACTS_BUCKET unset"}
+    try:
+        client = storage_client()
+        bucket = client.bucket(name)
+        exists = bucket.exists(timeout=timeout_sec)
+        return {"ok": True, "bucket": name, "bucket_exists": bool(exists)}
+    except Exception as e:
+        return {"ok": False, "bucket": name, "error": str(e)[:400]}
 
 
 def _credentials_json_path() -> Optional[Path]:
@@ -37,12 +129,16 @@ def _credentials_json_path() -> Optional[Path]:
 
 
 def storage_client() -> storage.Client:
-    """Client for GCS — prefers GCS_APPLICATION_CREDENTIALS, then default ADC path."""
+    """Client for GCS — inline JSON env, then key file path, then ADC."""
     project = (
         os.getenv("GCS_PROJECT_ID", "").strip()
         or os.getenv("GCLOUD_PROJECT_ID", "").strip()
         or None
     )
+    info = _load_service_account_info_from_env()
+    if info:
+        pid = project or info.get("project_id")
+        return storage.Client.from_service_account_info(info, project=pid)
     path = _credentials_json_path()
     if path:
         return storage.Client.from_service_account_json(str(path), project=project)

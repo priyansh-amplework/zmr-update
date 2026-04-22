@@ -2,6 +2,9 @@
 .env
 **/.env
 *.env.local
+google_credentials_one_line_for_railway.txt
+**/google_credentials_one_line_for_railway.txt
+**/gcs_service_account.json
 
 # Python
 __pycache__/
