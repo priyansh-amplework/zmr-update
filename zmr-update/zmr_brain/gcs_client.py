@@ -99,8 +99,9 @@ def gcs_credentials_mode() -> Dict[str, Any]:
 
 def gcs_bucket_probe(*, timeout_sec: float = 12.0) -> Dict[str, Any]:
     """
-    One lightweight GCS call for diagnostics: whether the configured bucket is visible
-    with current credentials (auth + IAM), without downloading chunk objects.
+    Lightweight GCS check aligned with **chunk reads** (``storage.objects.list``), not
+    ``storage.buckets.get``. Object Viewer on the bucket can list objects but cannot
+    call :meth:`google.cloud.storage.Bucket.exists`, which would falsely show failure.
     """
     name = (os.getenv("GCS_ARTIFACTS_BUCKET") or "").strip()
     if not name:
@@ -108,8 +109,9 @@ def gcs_bucket_probe(*, timeout_sec: float = 12.0) -> Dict[str, Any]:
     try:
         client = storage_client()
         bucket = client.bucket(name)
-        exists = bucket.exists(timeout=timeout_sec)
-        return {"ok": True, "bucket": name, "bucket_exists": bool(exists)}
+        # One list call — same permission family as reading chunk bodies.
+        next(bucket.list_blobs(max_results=1, timeout=timeout_sec), None)
+        return {"ok": True, "bucket": name, "object_list_ok": True}
     except Exception as e:
         return {"ok": False, "bucket": name, "error": str(e)[:400]}
 
