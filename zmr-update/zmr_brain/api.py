@@ -30,8 +30,9 @@ from zmr_brain.constants import (
     DEFAULT_RERANK_POOL,
     DEFAULT_RRF_K,
     DEFAULT_USER_ROLE,
-    PINECONE_INDEX,
     ACCESS_TIERS,
+    PINECONE_INDEX,
+    PINECONE_INDEX_BY_TIER,
     namespaces_for_email,
     pinecone_access_filter,
 )
@@ -311,6 +312,90 @@ def health():
 @app.get("/v1/access-tiers")
 def list_access_tiers() -> Dict[str, Any]:
     return {"tiers": list(ACCESS_TIERS), "index": PINECONE_INDEX}
+
+
+@app.get("/v1/retrieval-status")
+def retrieval_status() -> Dict[str, Any]:
+    """Lightweight wiring check: Postgres row counts / pinecone_index mix vs configured Pinecone indexes."""
+    out: Dict[str, Any] = {
+        "postgres_ok": False,
+        "postgres_error": None,
+        "chunk_tables": {},
+        "pinecone_indexes_configured": dict(PINECONE_INDEX_BY_TIER),
+        "pinecone_per_index": {},
+        "pinecone_indexes_queried_for_full_tier_user": namespaces_for_email(
+            "nobody@zmrcapital.com"
+        ),
+        "pinecone_indexes_queried_for_executive_example": namespaces_for_email(
+            "zamir@zmrcapital.com"
+        ),
+        "hints": [
+            "Set ZMR_PINECONE_INDEX_* env vars if Postgres `pinecone_index` values do not match "
+            "the names under pinecone_indexes_configured.",
+            "If Pinecone shows vectors but chunk tables are empty (or vice versa), run ingest "
+            "against this DATABASE_URL or fix DB vs Pinecone project mismatch.",
+            "Rows with empty chunk_text and no readable GCS body are dropped before the LLM — "
+            "re-ingest or fix GCS credentials if hits exist but answers say no passages.",
+        ],
+    }
+
+    try:
+        from zmr_brain.retrieval import pg_connect, pg_release
+
+        conn, cursor_factory = pg_connect()
+        try:
+            with conn.cursor(cursor_factory=cursor_factory) as cur:
+                out["postgres_ok"] = True
+                for table in ("chunks_v2", "chunks"):
+                    try:
+                        cur.execute(f"SELECT COUNT(*)::bigint AS n FROM {table}")
+                        row = cur.fetchone()
+                        n = int(row["n"]) if row else 0
+                        by_idx: Dict[str, int] = {}
+                        try:
+                            cur.execute(
+                                f"SELECT pinecone_index, COUNT(*)::bigint AS n "
+                                f"FROM {table} GROUP BY 1 ORDER BY 2 DESC"
+                            )
+                            for r in cur.fetchall():
+                                key = r["pinecone_index"] or ""
+                                by_idx[str(key)] = int(r["n"])
+                        except Exception:
+                            pass
+                        out["chunk_tables"][table] = {"total_rows": n, "by_pinecone_index": by_idx}
+                    except Exception as e:
+                        out["chunk_tables"][table] = {"error": str(e)}
+        finally:
+            pg_release(conn)
+    except Exception as e:
+        out["postgres_error"] = str(e)
+
+    from zmr_brain.clients import get_pinecone_index
+
+    for name in sorted(set(PINECONE_INDEX_BY_TIER.values())):
+        try:
+            idx = get_pinecone_index(name)
+            stats = idx.describe_index_stats()
+            vec_total: Optional[int] = None
+            if hasattr(stats, "total_vector_count"):
+                vec_total = int(getattr(stats, "total_vector_count") or 0)
+            elif isinstance(stats, dict):
+                vec_total = int(stats.get("total_vector_count") or 0)
+                if not vec_total and stats.get("namespaces"):
+                    ns = stats["namespaces"]
+                    vec_total = sum(
+                        int(v.get("vector_count", 0) or 0)
+                        for v in ns.values()
+                        if isinstance(v, dict)
+                    )
+            out["pinecone_per_index"][name] = {
+                "ok": True,
+                "total_vector_count": vec_total,
+            }
+        except Exception as e:
+            out["pinecone_per_index"][name] = {"ok": False, "error": str(e)}
+
+    return out
 
 
 @app.post("/v1/query", response_model=QueryResponse)

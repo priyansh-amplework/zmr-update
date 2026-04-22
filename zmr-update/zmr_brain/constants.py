@@ -13,16 +13,34 @@ vectors to the index for the content’s ``access_tier``; vectors use the defaul
 namespace (empty string) within each index.
 
 Field names for Pinecone / Drive / Postgres metadata: :mod:`zmr_brain.metadata_schema`.
+
+Environment overrides (must match indexes used at **ingest** time or queries return no hits):
+
+- ``ZMR_PINECONE_INDEX_FULL`` (default ``zmr-brain-full``)
+- ``ZMR_PINECONE_INDEX_EXECUTIVE_ONLY`` (default ``zmr-brain-executive-only``)
+- ``ZMR_PINECONE_INDEX_RESTRICTED_ACCOUNTING`` (default ``zmr-brain-restricted-accounting``)
 """
 
 from __future__ import annotations
 
+import os
 from typing import Dict, FrozenSet, List, Set
 
+
+def _pinecone_index_from_env(var: str, default: str) -> str:
+    v = (os.getenv(var) or "").strip()
+    return v if v else default
+
+
 PINECONE_INDEX_BY_TIER: Dict[str, str] = {
-    "full": "zmr-brain-full",
-    "executive_only": "zmr-brain-executive-only",
-    "restricted_accounting": "zmr-brain-restricted-accounting",
+    "full": _pinecone_index_from_env("ZMR_PINECONE_INDEX_FULL", "zmr-brain-full"),
+    "executive_only": _pinecone_index_from_env(
+        "ZMR_PINECONE_INDEX_EXECUTIVE_ONLY", "zmr-brain-executive-only"
+    ),
+    "restricted_accounting": _pinecone_index_from_env(
+        "ZMR_PINECONE_INDEX_RESTRICTED_ACCOUNTING",
+        "zmr-brain-restricted-accounting",
+    ),
 }
 
 # Default single-index alias (public tier) — backward compat for scripts using one name.
