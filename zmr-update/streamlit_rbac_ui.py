@@ -139,7 +139,7 @@ def _query_graph_http(
     base = _zmr_api_base()
     if not base:
         raise RuntimeError("ZMR_API_BASE_URL is not set")
-    url = f"{base}/v1/query/graph"
+    url = f"{base}/v1/query/graph/stream"
     payload: Dict[str, Any] = {
         "query": user_text,
         "user_email": user_email,
@@ -159,22 +159,41 @@ def _query_graph_http(
         "skip_query_reformulation": skip_query_reformulation,
     }
     body = json.dumps(payload).encode("utf-8")
-    timeout = float(os.getenv("ZMR_API_TIMEOUT_SEC", "300"))
+    timeout = float(os.getenv("ZMR_API_TIMEOUT_SEC", "900"))
     req = urllib.request.Request(
         url,
         data=body,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/x-ndjson, application/json",
+        },
         method="POST",
     )
+    last: Optional[Dict[str, Any]] = None
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
+            while True:
+                raw_line = resp.readline()
+                if not raw_line:
+                    break
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                if obj.get("heartbeat"):
+                    continue
+                if "error" in obj and "node" not in obj:
+                    raise RuntimeError(f"Backend stream error: {obj.get('error')}")
+                if "node" in obj and "state" in obj:
+                    last = obj["state"]
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"Backend HTTP {e.code}: {err_body[:1200]}") from e
     except urllib.error.URLError as e:
         raise RuntimeError(f"Backend unreachable: {e}") from e
-    return json.loads(raw)
+    if last is None:
+        raise RuntimeError("Backend stream returned no result line (only heartbeats or empty body)")
+    return last
 
 
 def _final_from_graph_api(data: Dict[str, Any], *, user_text: str) -> Dict[str, Any]:

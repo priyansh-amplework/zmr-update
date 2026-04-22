@@ -8,10 +8,13 @@ Run from repository root:
 
 from __future__ import annotations
 
+import json
 import os
+import queue
+import threading
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -19,7 +22,7 @@ load_dotenv()
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from zmr_brain.answer import answer_with_claude
@@ -33,7 +36,7 @@ from zmr_brain.constants import (
     pinecone_access_filter,
 )
 from zmr_brain.meta_queries import chatbot_meta_reply
-from zmr_brain.query_graph import run_query_graph
+from zmr_brain.query_graph import run_query_graph, stream_query_graph
 from zmr_brain.query_reformulate import reformulate_query_for_retrieval
 from zmr_brain.query_routing import OUT_OF_SCOPE_REPLY, classify_query
 from zmr_brain.retrieval import RetrievedChunk, retrieve_for_query
@@ -137,6 +140,52 @@ class QueryGraphResponse(QueryResponse):
     retrieval_query: Optional[str] = None
 
 
+def _invoke_query_graph(body: QueryRequest) -> Dict[str, Any]:
+    user_email = (body.user_email or "").strip().lower()
+    flt: Optional[Dict[str, Any]] = None
+    if body.filter_file_sha256:
+        flt = {"file_sha256": {"$eq": body.filter_file_sha256.strip()}}
+    return run_query_graph(
+        body.query,
+        body.user_role,
+        user_email=user_email,
+        top_k=body.top_k,
+        embed_model=body.embed_model,
+        metadata_filter=flt,
+        skip_query_reformulation=body.skip_query_reformulation,
+        generate_answer=body.generate_answer,
+        hybrid_rrf=body.hybrid_rrf,
+        rrf_k=body.rrf_k,
+        candidate_pool=body.candidate_pool,
+        pinecone_rerank=body.pinecone_rerank,
+        rerank_pool=body.rerank_pool,
+        pinecone_rerank_model=body.pinecone_rerank_model,
+        lexical_mode=body.lexical_mode,
+    )
+
+
+def _query_graph_response_from_final(
+    body: QueryRequest, final: Dict[str, Any]
+) -> QueryGraphResponse:
+    user_email = (body.user_email or "").strip().lower()
+    err = final.get("error")
+    chunks = final.get("chunks") or []
+    idx = final.get("pinecone_index") or PINECONE_INDEX
+    return QueryGraphResponse(
+        pinecone_index=idx,
+        user_email=user_email,
+        user_role=body.user_role.strip().lower(),
+        query=body.query,
+        chunks=[_chunk_to_out(c) for c in chunks],
+        answer=final.get("answer"),
+        error=err,
+        graph_trace=list(final.get("graph_trace") or []),
+        meta_intro=bool(final.get("meta_intro")),
+        refuse_out_of_scope=bool(final.get("refuse_out_of_scope")),
+        retrieval_query=final.get("retrieval_query"),
+    )
+
+
 def _chunk_to_out(c: RetrievedChunk) -> ChunkOut:
     return ChunkOut(
         rank=c.rank,
@@ -154,6 +203,84 @@ def _chunk_to_out(c: RetrievedChunk) -> ChunkOut:
         gcs_uri=c.gcs_uri,
         pinecone_metadata=dict(c.pinecone_metadata or {}),
     )
+
+
+def _serialize_graph_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    """JSON-safe copy of graph state for NDJSON (chunks → ChunkOut dicts)."""
+    out: Dict[str, Any] = dict(state)
+    raw = out.get("chunks") or []
+    serial: List[Dict[str, Any]] = []
+    for c in raw:
+        if isinstance(c, RetrievedChunk):
+            serial.append(_chunk_to_out(c).model_dump())
+        elif isinstance(c, dict):
+            serial.append(dict(c))
+        else:
+            serial.append(_chunk_to_out(c).model_dump())
+    out["chunks"] = serial
+    return out
+
+
+def _stream_query_graph_kwargs(body: QueryRequest) -> Dict[str, Any]:
+    user_email = (body.user_email or "").strip().lower()
+    flt: Optional[Dict[str, Any]] = None
+    if body.filter_file_sha256:
+        flt = {"file_sha256": {"$eq": body.filter_file_sha256.strip()}}
+    return {
+        "user_email": user_email,
+        "top_k": body.top_k,
+        "embed_model": body.embed_model,
+        "metadata_filter": flt,
+        "skip_query_reformulation": body.skip_query_reformulation,
+        "generate_answer": body.generate_answer,
+        "hybrid_rrf": body.hybrid_rrf,
+        "rrf_k": body.rrf_k,
+        "candidate_pool": body.candidate_pool,
+        "pinecone_rerank": body.pinecone_rerank,
+        "rerank_pool": body.rerank_pool,
+        "pinecone_rerank_model": body.pinecone_rerank_model,
+        "lexical_mode": body.lexical_mode,
+    }
+
+
+def _graph_stream_events(body: QueryRequest) -> Iterator[bytes]:
+    hb_sec = max(1.0, float(os.getenv("ZMR_GRAPH_STREAM_HEARTBEAT_SEC", "12")))
+    hb_line = (json.dumps({"heartbeat": True}) + "\n").encode("utf-8")
+    q: queue.Queue[Tuple[Any, ...]] = queue.Queue()
+
+    def producer() -> None:
+        try:
+            kw = _stream_query_graph_kwargs(body)
+            for node_name, st in stream_query_graph(body.query, body.user_role, **kw):
+                q.put(("step", node_name, st))
+        except Exception as e:
+            q.put(("exc", e))
+            return
+        q.put(("end",))
+
+    threading.Thread(target=producer, daemon=True).start()
+
+    while True:
+        try:
+            item = q.get(timeout=hb_sec)
+        except queue.Empty:
+            yield hb_line
+            continue
+        kind = item[0]
+        if kind == "step":
+            node_name = item[1]
+            state = item[2]
+            payload = {
+                "node": node_name,
+                "state": _serialize_graph_state(dict(state)),
+            }
+            yield (json.dumps(payload, default=str) + "\n").encode("utf-8")
+        elif kind == "exc":
+            err = item[1]
+            yield (json.dumps({"error": str(err)}) + "\n").encode("utf-8")
+            return
+        elif kind == "end":
+            break
 
 
 @app.get("/health")
@@ -250,50 +377,25 @@ def post_query(body: QueryRequest) -> QueryResponse:
 
 @app.post("/v1/query/graph", response_model=QueryGraphResponse)
 def post_query_graph(body: QueryRequest) -> QueryGraphResponse:
-    user_email = (body.user_email or "").strip().lower()
-    flt: Optional[Dict[str, Any]] = None
-    if body.filter_file_sha256:
-        flt = {"file_sha256": {"$eq": body.filter_file_sha256.strip()}}
-
     try:
-        final = run_query_graph(
-            body.query,
-            body.user_role,
-            user_email=user_email,
-            top_k=body.top_k,
-            embed_model=body.embed_model,
-            metadata_filter=flt,
-            skip_query_reformulation=body.skip_query_reformulation,
-            generate_answer=body.generate_answer,
-            hybrid_rrf=body.hybrid_rrf,
-            rrf_k=body.rrf_k,
-            candidate_pool=body.candidate_pool,
-            pinecone_rerank=body.pinecone_rerank,
-            rerank_pool=body.rerank_pool,
-            pinecone_rerank_model=body.pinecone_rerank_model,
-            lexical_mode=body.lexical_mode,
-        )
+        final = _invoke_query_graph(body)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Graph run failed: {e}") from e
 
     err = final.get("error")
     chunks = final.get("chunks") or []
-    idx = final.get("pinecone_index") or PINECONE_INDEX
 
     if err and not chunks:
         bad_input = "query is empty" in (err or "")
         raise HTTPException(status_code=400 if bad_input else 503, detail=err)
 
-    return QueryGraphResponse(
-        pinecone_index=idx,
-        user_email=user_email,
-        user_role=body.user_role.strip().lower(),
-        query=body.query,
-        chunks=[_chunk_to_out(c) for c in chunks],
-        answer=final.get("answer"),
-        error=err,
-        graph_trace=list(final.get("graph_trace") or []),
-        meta_intro=bool(final.get("meta_intro")),
-        refuse_out_of_scope=bool(final.get("refuse_out_of_scope")),
-        retrieval_query=final.get("retrieval_query"),
+    return _query_graph_response_from_final(body, final)
+
+
+@app.post("/v1/query/graph/stream")
+def post_query_graph_stream(body: QueryRequest) -> StreamingResponse:
+    return StreamingResponse(
+        _graph_stream_events(body),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache"},
     )
