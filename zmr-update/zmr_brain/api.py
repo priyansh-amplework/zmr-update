@@ -365,6 +365,56 @@ def retrieval_status() -> Dict[str, Any]:
                         out["chunk_tables"][table] = {"total_rows": n, "by_pinecone_index": by_idx}
                     except Exception as e:
                         out["chunk_tables"][table] = {"error": str(e)}
+                # Why passages can be empty even when GCS credentials work: DB may point at other buckets.
+                try:
+                    cur.execute(
+                        """
+                        SELECT substring(chunk_gcs_uri FROM '^gs://([^/]+)') AS bucket,
+                               COUNT(*)::bigint AS n
+                        FROM chunks_v2
+                        WHERE chunk_gcs_uri ~ '^gs://[^/]+/'
+                        GROUP BY 1
+                        ORDER BY 2 DESC
+                        LIMIT 25
+                        """
+                    )
+                    gs_buckets = {
+                        str(r["bucket"]): int(r["n"])
+                        for r in cur.fetchall()
+                        if r and r.get("bucket")
+                    }
+                    cur.execute(
+                        """
+                        SELECT
+                          COUNT(*) FILTER (WHERE chunk_gcs_uri ~ '^gs://[^/]+/'
+                            AND (chunk_text IS NULL OR btrim(chunk_text::text) = '')
+                          )::bigint AS empty_inline_with_gs,
+                          COUNT(*) FILTER (WHERE chunk_gcs_uri IS NOT NULL
+                            AND btrim(chunk_gcs_uri::text) <> ''
+                            AND chunk_gcs_uri !~ '^gs://[^/]+/'
+                            AND chunk_gcs_uri !~ '^local:'
+                          )::bigint AS non_gs_non_local_uri
+                        FROM chunks_v2
+                        """
+                    )
+                    row_w = cur.fetchone() or {}
+                    env_bucket = (os.getenv("GCS_ARTIFACTS_BUCKET") or "").strip()
+                    top = max(gs_buckets, key=gs_buckets.get) if gs_buckets else None
+                    out["chunk_body_wiring"] = {
+                        "chunks_v2_gs_bucket_row_counts": gs_buckets,
+                        "chunks_v2_empty_inline_text_with_gs_uri": int(
+                            row_w.get("empty_inline_with_gs") or 0
+                        ),
+                        "chunks_v2_non_gs_non_local_uri_rows": int(
+                            row_w.get("non_gs_non_local_uri") or 0
+                        ),
+                        "GCS_ARTIFACTS_BUCKET_env": env_bucket or None,
+                        "top_gs_bucket_matches_env": (
+                            top == env_bucket if (top and env_bucket) else None
+                        ),
+                    }
+                except Exception as e:
+                    out["chunk_body_wiring"] = {"error": str(e)}
         finally:
             pg_release(conn)
     except Exception as e:
@@ -406,6 +456,19 @@ def retrieval_status() -> Dict[str, Any]:
 
     sha = (os.getenv("RAILWAY_GIT_COMMIT_SHA") or "").strip()
     out["deploy"] = {"railway_git_commit_sha": sha or None}
+    out["api_env"] = {
+        "voyage_api_key_set": bool((os.getenv("VOYAGE_API_KEY") or "").strip()),
+        "pinecone_api_key_set": bool((os.getenv("PINECONE_API_KEY") or "").strip()),
+        "anthropic_api_key_set": bool((os.getenv("ANTHROPIC_API_KEY") or "").strip()),
+    }
+
+    cw = out.get("chunk_body_wiring")
+    if isinstance(cw, dict) and cw.get("top_gs_bucket_matches_env") is False:
+        out["hints"].append(
+            "chunk_body_wiring.top_gs_bucket_matches_env is false: most `chunk_gcs_uri` rows live in a "
+            "different bucket than GCS_ARTIFACTS_BUCKET — fix the env var or re-ingest so URIs match a "
+            "bucket this service account can read."
+        )
 
     return out
 
