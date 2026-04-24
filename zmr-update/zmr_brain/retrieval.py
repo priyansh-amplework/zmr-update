@@ -30,7 +30,11 @@ _SCRIPTS = _ROOT / "scripts"
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-from db_url import ensure_ssl_for_managed  # noqa: E402
+from db_url import (  # noqa: E402
+    apply_managed_postgres_keepalive,
+    effective_database_url,
+    ensure_ssl_for_managed,
+)
 
 _pg_pool: Optional[psycopg2.pool.ThreadedConnectionPool] = None
 _pg_pool_lock = _threading.Lock()
@@ -42,10 +46,12 @@ def _get_pg_pool() -> psycopg2.pool.ThreadedConnectionPool:
         return _pg_pool
     with _pg_pool_lock:
         if _pg_pool is None:
-            url = os.getenv("DATABASE_URL", "").strip()
+            url = effective_database_url()
             if not url:
-                raise RuntimeError("DATABASE_URL is not set")
-            url = ensure_ssl_for_managed(url)
+                raise RuntimeError(
+                    "No database URL: set RDS_DATABASE_URL or DATABASE_URL"
+                )
+            url = apply_managed_postgres_keepalive(ensure_ssl_for_managed(url))
             _pg_pool = psycopg2.pool.ThreadedConnectionPool(
                 minconn=1, maxconn=8, dsn=url,
             )

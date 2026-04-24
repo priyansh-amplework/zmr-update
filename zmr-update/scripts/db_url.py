@@ -1,13 +1,31 @@
-"""Shared DATABASE_URL helpers for Render / cloud Postgres."""
+"""Shared DATABASE_URL helpers for Render / RDS / cloud Postgres."""
 
+import os
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 
+def effective_database_url() -> str:
+    """Prefer ``RDS_DATABASE_URL`` when set, else ``DATABASE_URL`` (strip whitespace)."""
+    for key in ("RDS_DATABASE_URL", "DATABASE_URL"):
+        v = (os.getenv(key) or "").strip()
+        if v:
+            return v
+    return ""
+
+
 def ensure_ssl_for_managed(url: str) -> str:
-    """Add sslmode=require for hosts that need TLS (e.g. Render external connections)."""
+    """Add sslmode=require for hosts that need TLS (e.g. Render, RDS, Neon)."""
     p = urlparse(url)
     host = (p.hostname or "").lower()
-    if not any(x in host for x in ("render.com", "supabase.co", "neon.tech")):
+    if not any(
+        x in host
+        for x in (
+            "render.com",
+            "supabase.co",
+            "neon.tech",
+            "rds.amazonaws.com",
+        )
+    ):
         return url
     q = dict(parse_qsl(p.query, keep_blank_values=True))
     if "sslmode" not in q and "ssl" not in q:
@@ -27,7 +45,15 @@ def apply_managed_postgres_keepalive(url: str) -> str:
     """
     p = urlparse(url)
     host = (p.hostname or "").lower()
-    if not any(x in host for x in ("render.com", "supabase.co", "neon.tech")):
+    if not any(
+        x in host
+        for x in (
+            "render.com",
+            "supabase.co",
+            "neon.tech",
+            "rds.amazonaws.com",
+        )
+    ):
         return url
     q = dict(parse_qsl(p.query, keep_blank_values=True))
     hints = {

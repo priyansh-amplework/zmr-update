@@ -9,7 +9,7 @@ Steps:
   refresh   — ingest_hellodata.py --refresh-stored (re-fetch all hellodata_properties)
 
 Environment (.env at repo root):
-  HELLO_DATA_API_KEY, DATABASE_URL
+  HELLO_DATA_API_KEY, and ``RDS_DATABASE_URL`` (preferred) or ``DATABASE_URL``
 
 Usage:
   venv/bin/python scripts/pipelines/run_hellodata_ingestion.py

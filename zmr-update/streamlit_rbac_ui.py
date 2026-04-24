@@ -519,7 +519,7 @@ def main() -> None:
                     f"1. Open `{api_dbg}/v1/retrieval-status` (check `gcs.mode` when that field exists).\n"
                     "2. Set `ZMR_PINECONE_INDEX_*` on the API if Postgres `pinecone_index` names differ.\n"
                     "3. Set `GOOGLE_APPLICATION_CREDENTIALS_JSON` on the **API** service for `gs://` bodies.\n"
-                    "4. `DATABASE_URL` on the API = DB you ingested."
+                    "4. `RDS_DATABASE_URL` or `DATABASE_URL` on the API = DB you ingested."
                 )
 
         rq = (final.get("retrieval_query") or "").strip()

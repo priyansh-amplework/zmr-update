@@ -333,7 +333,7 @@ def retrieval_status() -> Dict[str, Any]:
             "Set ZMR_PINECONE_INDEX_* env vars if Postgres `pinecone_index` values do not match "
             "the names under pinecone_indexes_configured.",
             "If Pinecone shows vectors but chunk tables are empty (or vice versa), run ingest "
-            "against this DATABASE_URL or fix DB vs Pinecone project mismatch.",
+            "against this database (RDS_DATABASE_URL or DATABASE_URL) or fix DB vs Pinecone project mismatch.",
             "Rows with empty chunk_text and no readable GCS body are dropped before the LLM — "
             "re-ingest or fix GCS credentials if hits exist but answers say no passages.",
         ],
